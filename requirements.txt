@@ -1,0 +1,6 @@
+mypy
+mypy-extensions
+structlog
+tomli
+typing_extensions
+aioconsole
