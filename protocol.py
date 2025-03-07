@@ -26,7 +26,7 @@ OPCODE_MULTI_ROOM_MSG = 0x30  # Send distinct messages to multiple rooms
 OPCODE_PRIVATE_MESSAGE = 0x31 # Send a private message to another user
 OPCODE_SECURE_MESSAGE = 0x32  # Send an encrypted message
 OPCODE_FILE_TRANSFER = 0x33   # Send a file to a user
-
+OPCODE_EPHEMERAL_MESSAGE = 0x34  # (Optional) Ephemeral messages that aren't stored
 
 # =====================================================
 # ERROR OPCODES (0xE0 - 0xFF) - Defines error messages
@@ -43,19 +43,13 @@ ERROR_SERVER_FULL = 0xE7           # No more clients can be accepted
 ERROR_PERMISSION_DENIED = 0xE8     # Client lacks permission
 ERROR_UNKNOWN = 0xFF               # Generic unknown error
 
-
-
 # =====================================================
 # MESSAGE STRUCTURE - Defines how messages are encoded
 # =====================================================
-
 @dataclass
 class Message:
     """
     Represents a structured message in the protocol.
-    
-    - `opcode`: Identifies the type of message (e.g., join room, send message)
-    - `payload`: The actual data sent (e.g., message text, room name)
     """
     opcode: int
     payload: str
@@ -68,25 +62,16 @@ class Message:
         - First 4 bytes: Opcode (integer)
         - Next 4 bytes: Payload length (integer)
         - Remaining bytes: Payload (string data)
-        
-        Returns:
-            bytes: Encoded binary message
         """
-        payload_bytes = self.payload.encode('utf-8')  
-        length = len(payload_bytes)  
-        return struct.pack('!II', self.opcode, length) + payload_bytes  
+        payload_bytes = self.payload.encode('utf-8')
+        length = len(payload_bytes)
+        return struct.pack('!II', self.opcode, length) + payload_bytes
 
     @staticmethod
     def decode(data: bytes):
         """
         Parses a binary message into a Message object.
-
-        Parameters:
-            data (bytes): Binary message received from a client or server.
-
-        Returns:
-            Message: Decoded Message object.
         """
-        opcode, length = struct.unpack('!II', data[:8])  
-        payload = data[8:8+length].decode('utf-8')  
-        return Message(opcode, payload)  
+        opcode, length = struct.unpack('!II', data[:8])
+        payload = data[8:8+length].decode('utf-8')
+        return Message(opcode, payload)

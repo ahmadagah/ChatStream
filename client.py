@@ -3,163 +3,222 @@ import structlog
 import traceback
 import struct
 import aioconsole
-from protocol import Message, OPCODE_HELLO, OPCODE_CREATE_ROOM, OPCODE_JOIN, OPCODE_LIST_ROOMS, OPCODE_LIST_USERS, OPCODE_LEAVE_ROOM, OPCODE_PRIVATE_MESSAGE, OPCODE_MULTI_ROOM_MSG, OPCODE_CLIENT_DISCONNECT, OPCODE_MESSAGE
+from protocol import (
+    OPCODE_JOIN,
+    Message,
+    # Basic Operations
+    OPCODE_HELLO, OPCODE_MESSAGE, OPCODE_ERROR,
+    # Room Management
+    OPCODE_CREATE_ROOM, OPCODE_LIST_ROOMS, OPCODE_LIST_USERS, OPCODE_LEAVE_ROOM,
+    # Connection Management
+    OPCODE_CLIENT_DISCONNECT, OPCODE_SERVER_DISCONNECT,
+    # Advanced Features
+    OPCODE_MULTI_ROOM_MSG, OPCODE_PRIVATE_MESSAGE, OPCODE_SECURE_MESSAGE, OPCODE_FILE_TRANSFER
+)
 
-
-
-# Initialize logger
+# Initialize a logger (for optional debug/info output)
 log = structlog.get_logger()
 
-async def chat_client():
+async def chat_client() -> None:
     """
-    Handles the client-side communication:
-    - Connects to the chat server.
-    - Sends and receives messages.
-    - Supports room management and private messaging.
+    Main entry point for the async client.
+
+    1. Connects to the chat server on 127.0.0.1:6060.
+    2. Sends a HELLO message with the chosen username.
+    3. Launches two concurrent tasks:
+       - send_messages(): Handles user input and sends it to the server.
+       - receive_messages(): Listens for incoming server messages and prints them.
+    4. Uses asyncio.gather() to run both tasks simultaneously.
     """
+    # 1. Connect to the server
     reader, writer = await asyncio.open_connection("127.0.0.1", 6060)
     log.info("Connected to server")
 
-    # Send username at the start
-    username = input("Enter your username: ").strip()
+    # 2. Prompt for username in a loop until we get one with no spaces
+    username = ""
+    while not username:
+        username_input = input("Enter your username: ").strip()
+        if " " in username_input:
+            print("Error: Usernames cannot contain spaces. Please try again.")
+            continue
+        if not username_input:
+            print("Error: Username cannot be empty. Please try again.")
+            continue
+        username = username_input
+
+
     writer.write(Message(OPCODE_HELLO, username).encode())
     await writer.drain()
     print(f"[DEBUG] Sent HELLO message with username: {username}")
 
-    # ✅ Read the welcome message immediately
-    # data = await reader.read(1024)
-    # if data:
-    #     msg = Message.decode(data)
-    #     print(f"[DEBUG] Received: Opcode={msg.opcode}, Payload={msg.payload}")
-    #     print(msg.payload)  # ✅ Show welcome message
-    # else:
-    #     print("[ERROR] No response from server!")
-
-    # raw_data = await reader.readexactly(8)  # Read fixed-length opcode + payload size
-    # opcode, length = struct.unpack('!II', raw_data)
-    # payload_data = await reader.readexactly(length)  # Read exact payload size
-    # msg = Message.decode(raw_data + payload_data)
-
-    # print(f"[DEBUG] Received: Opcode={msg.opcode}, Payload={msg.payload}")
-
-
-    print("[DEBUG] Creating send_messages() and receive_messages() tasks...")
+    # 3. Create tasks for sending & receiving messages
+    # print("[DEBUG] Creating send_messages() and receive_messages() tasks...")
     send_task = asyncio.create_task(send_messages(writer))
     receive_task = asyncio.create_task(receive_messages(reader))
 
-    print("[DEBUG] send_messages() registered in event loop.")
-    print("[DEBUG] receive_messages() registered in event loop.")
+    # print("[DEBUG] send_messages() registered in event loop.")
+    # print("[DEBUG] receive_messages() registered in event loop.")
 
+    # 4. Run both tasks concurrently
     try:
         print("[DEBUG] Running asyncio.gather() to start both tasks...")
-        result = await asyncio.gather(send_task, receive_task, return_exceptions=True) # Wait for both tasks to complete
-        print("[DEBUG] asyncio.gather() finished with result: {result}") # ✅ Confirm completion
+        results = await asyncio.gather(send_task, receive_task, return_exceptions=True)
+        print(f"[DEBUG] asyncio.gather() finished with results: {results}")
     except Exception as e:
         print(f"[ERROR] Exception in asyncio.gather(): {e}")
         traceback.print_exc()
 
-
-
-
-async def send_messages(writer):
+async def send_messages(writer: asyncio.StreamWriter) -> None:
     """
-    Reads user input, encodes messages, and sends them to the server.
+    Reads user input (non-blocking via aioconsole.ainput), encodes commands into Message objects,
+    and sends them to the server using the appropriate opcode.
+
+    Supported commands (example usage):
+      /create <room_name>       -> Create a new chat room
+      /list                     -> List all active rooms
+      /join <room_name>         -> Join a specific room
+      /leave <room_name>        -> Leave a specific room
+      /users <room_name>        -> List all users in the specified room
+      /msg <username> <message> -> Private message to a single user
+      /multi <rooms> <message>  -> Send a message to multiple rooms (comma-separated)
+      /secure <message>         -> Send a secure (encrypted) message
+      /file <filename>          -> Send a file to another user/room (basic stub)
+      /quit                     -> Disconnect from the server
+      Anything else             -> Treated as a normal chat message
     """
-    print("[DEBUG] send_messages() started...")  # Debugging output
+    print("[DEBUG] send_messages() started...")
 
     while True:
-        print("[DEBUG] Waiting for user input...")  # ✅ Debugging message
-        # user_input = input("> ").strip()
-
-
-        print("[DEBUG] Before aiconsole.ainput()")
+        # Prompt for user input in a non-blocking way
         user_input = await aioconsole.ainput("> ")
-        print(f"[DEBUG] After aiconsole.ainput(), user_input={user_input!r}")
 
+        # Clean up whitespace
         user_input = user_input.strip()
         if not user_input:
-            continue  # Ignore empty messages
+            # Ignore empty lines
+            continue
 
-        # print(f"[DEBUG] Sending user input: {user_input}")
+        # Decide which opcode to use based on the command
+        msg = None
 
+        # 1. Join a Room
         if user_input.startswith("/join "):
             room = user_input.split(" ", 1)[1]
-            msg = Message(OPCODE_JOIN, room)
+            msg = Message(opcode=OPCODE_JOIN, payload=room)
 
+        # 2. Create a Room
         elif user_input.startswith("/create "):
             parts = user_input.split(" ", 1)
-            if len(parts) < 2 or not parts[1].strip():
+            room_name = parts[1].strip() if len(parts) > 1 else ""
+            if not room_name:
                 print("Usage: /create <room_name>")
                 continue
-            room = parts[1].strip()
-            msg = Message(OPCODE_CREATE_ROOM, room)
+            msg = Message(opcode=OPCODE_CREATE_ROOM, payload=room_name)
 
+        # 3. List Rooms
         elif user_input == "/list":
-            msg = Message(OPCODE_LIST_ROOMS, "")
+            msg = Message(opcode=OPCODE_LIST_ROOMS, payload="")
 
+        # 4. Leave a Room
+        elif user_input.startswith("/leave "):
+            parts = user_input.split(" ", 1)
+            room_name = parts[1].strip() if len(parts) > 1 else ""
+            if not room_name:
+                print("Usage: /leave <room_name>")
+                continue
+            msg = Message(opcode=OPCODE_LEAVE_ROOM, payload=room_name)
+
+        # 5. List Users in a Room
+        elif user_input.startswith("/users "):
+            parts = user_input.split(" ", 1)
+            room_name = parts[1].strip() if len(parts) > 1 else ""
+            if not room_name:
+                print("Usage: /users <room_name>")
+                continue
+            msg = Message(opcode=OPCODE_LIST_USERS, payload=room_name)
+
+        # 6. Private Message
+        elif user_input.startswith("/msg "):
+            parts = user_input.split(" ", 2)
+            if len(parts) < 3:
+                print("Usage: /msg <username> <message>")
+                continue
+            recipient, message_text = parts[1], parts[2]
+            payload = f"{recipient} {message_text}"
+            msg = Message(opcode=OPCODE_PRIVATE_MESSAGE, payload=payload)
+
+        # 7. Multi-Room Message
+        elif user_input.startswith("/multi "):
+            parts = user_input.split(" ", 2)
+            if len(parts) < 3:
+                print("Usage: /multi <room1,room2> <message>")
+                continue
+            room_list, message_text = parts[1], parts[2]
+            payload = f"{room_list} {message_text}"
+            msg = Message(opcode=OPCODE_MULTI_ROOM_MSG, payload=payload)
+
+        # 8. Secure Message
+        elif user_input.startswith("/secure "):
+            # Minimal approach: treat it like a normal message but different opcode
+            secure_text = user_input.split(" ", 1)[1]
+            msg = Message(opcode=OPCODE_SECURE_MESSAGE, payload=secure_text)
+
+        # 9. File Transfer
+        elif user_input.startswith("/file "):
+            # Basic example: just send the filename (no actual file chunking)
+            filename = user_input.split(" ", 1)[1]
+            msg = Message(opcode=OPCODE_FILE_TRANSFER, payload=filename)
+
+        # 10. Quit
         elif user_input == "/quit":
-            msg = Message(OPCODE_CLIENT_DISCONNECT, "Goodbye!")
+            msg = Message(opcode=OPCODE_CLIENT_DISCONNECT, payload="Goodbye!")
             writer.write(msg.encode())
             await writer.drain()
             print("[DEBUG] Sent DISCONNECT message. Closing client.")
 
+            # Close the connection gracefully
             writer.close()
             await writer.wait_closed()
-
             print("[DEBUG] send_messages() exiting.")
             return
 
+        # Otherwise, treat as a normal chat message
         else:
-            msg = Message(OPCODE_MESSAGE, user_input)
+            msg = Message(opcode=OPCODE_MESSAGE, payload=user_input)
 
+        # Send the Message to the server
         writer.write(msg.encode())
         await writer.drain()
         print(f"[DEBUG] Sent message: Opcode={msg.opcode}, Payload={msg.payload}")
 
-async def receive_messages(reader):
+async def receive_messages(reader: asyncio.StreamReader) -> None:
     """
-    Listens for incoming messages from the server and prints them.
+    Continuously reads incoming messages from the server and prints them.
+
+    1. Uses reader.read(1024) in a loop to receive data.
+    2. Decodes the data into a Message object (opcode + payload).
+    3. Prints debug info about the incoming message.
+    4. If no data is received, it means the server disconnected or closed the connection.
     """
-    print("[DEBUG] receive_messages() function started and waiting for server messages...")  # ✅ Confirm function start
-
-    # Check if reader is properly assigned a transport
-
-    print("[DEBUG] Entering message listening loop...")  # 🔥 Ensure we reach the while-loop
-    loop_counter = 0  # ✅ Track the number of times this loop runs
+    print("[DEBUG] receive_messages() function started and waiting for server messages...")
+    loop_counter = 0
 
     while True:
         try:
-            print("[DEBUG] Waiting for incoming messages...")  # ✅ Ensure loop is running
             loop_counter += 1
-            print(f"[DEBUG] Loop iteration {loop_counter} - Checking for server messages...")  # ✅ Loop runs?
+            # print(f"[DEBUG] Loop iteration {loop_counter} - Checking for server messages...")
 
-            # ✅ Check if the reader is ready to receive data
-            # if reader.at_eof():
-            #     print("[DEBUG] Reader is at EOF. Server may have closed the connection.")
-            #     break
-
-            # ✅ Try reading raw bytes
-            raw_data = await reader.read(1024)  # 🔥 Use regular `read` instead of `readexactly`
+            # Read up to 1024 bytes
+            raw_data = await reader.read(1024)
             if not raw_data:
                 print("[DEBUG] No data received. Server might have closed the connection.")
-                break  
+                break
 
-            print(f"[DEBUG] Raw data received (Iteration {loop_counter}): {raw_data}")  # ✅ Check raw bytes
+            # print(f"[DEBUG] Raw data received (Iteration {loop_counter}): {raw_data}")
 
-            print(f"[DEBUG] Raw Data Before Decoding: {raw_data}")  # ✅ Print raw bytes
-
-            # Decode the message
+            # Decode the raw bytes into a Message
             msg = Message.decode(raw_data)
-            print(f"[DEBUG] Decoded Message: Opcode={msg.opcode}, Payload={msg.payload}")  # ✅ Print decoded message
-
-
-            # raw_data = await reader.readexactly(8)  # Read opcode + payload size
-            # opcode, length = struct.unpack('!II', raw_data)
-            # payload_data = await reader.readexactly(length)  # Read the exact payload
-
-            # msg = Message.decode(raw_data + payload_data)
-            # print(f"[DEBUG] Fully Decoded Message: Opcode={msg.opcode}, Payload={msg.payload}")
-
+            print(f"[DEBUG] Decoded Message: Opcode={msg.opcode}, Payload={msg.payload}")
 
         except asyncio.IncompleteReadError:
             print("[ERROR] Incomplete message received. Connection may be unstable.")
@@ -171,13 +230,8 @@ async def receive_messages(reader):
             print(f"[ERROR] Exception in receive_messages(): {e}")
             traceback.print_exc()
 
-    print("[DEBUG] receive_messages() exiting.")  # ✅ Confirm function exit
-
-
-
-
-
-
+    print("[DEBUG] receive_messages() exiting.")
 
 if __name__ == "__main__":
+    # Start the async client
     asyncio.run(chat_client())
