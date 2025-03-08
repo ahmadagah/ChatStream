@@ -1,9 +1,12 @@
 import asyncio
+import base64
 import structlog
 import traceback
 import struct
+from cryptography.fernet import Fernet
 import aioconsole
 from protocol import (
+    OPCODE_EPHEMERAL_MESSAGE,
     OPCODE_JOIN,
     Message,
     # Basic Operations
@@ -19,6 +22,13 @@ from protocol import (
 # Initialize a logger (for optional debug/info output)
 log = structlog.get_logger()
 
+
+
+# Secret key for secure messaging (NOTE: In a real-world app, use a shared key exchange method)
+fernet_key = Fernet.generate_key()
+cipher = Fernet(fernet_key)  # This is used to encrypt secure messages
+
+
 async def chat_client() -> None:
     """
     Main entry point for the async client.
@@ -31,7 +41,7 @@ async def chat_client() -> None:
     4. Uses asyncio.gather() to run both tasks simultaneously.
     """
     # 1. Connect to the server
-    reader, writer = await asyncio.open_connection("127.0.0.1", 6060)
+    reader, writer = await asyncio.open_connection("127.0.0.1", 8080)
     log.info("Connected to server")
 
     # 2. Prompt for username in a loop until we get one with no spaces
@@ -46,7 +56,7 @@ async def chat_client() -> None:
             continue
         username = username_input
 
-
+    # Send a HELLO message with the chosen username
     writer.write(Message(OPCODE_HELLO, username).encode())
     await writer.drain()
     print(f"[DEBUG] Sent HELLO message with username: {username}")
@@ -157,17 +167,39 @@ async def send_messages(writer: asyncio.StreamWriter) -> None:
             payload = f"{room_list} {message_text}"
             msg = Message(opcode=OPCODE_MULTI_ROOM_MSG, payload=payload)
 
-        # 8. Secure Message
+        # ✅ Secure Message (NEW)
         elif user_input.startswith("/secure "):
-            # Minimal approach: treat it like a normal message but different opcode
             secure_text = user_input.split(" ", 1)[1]
-            msg = Message(opcode=OPCODE_SECURE_MESSAGE, payload=secure_text)
+            encrypted_text = cipher.encrypt(secure_text.encode()).decode()  # Encrypt message
+            msg = Message(OPCODE_SECURE_MESSAGE, payload=encrypted_text)
 
-        # 9. File Transfer
+        # ✅ Ephemeral Message (NEW)
+        elif user_input.startswith("/ephemeral "):
+            parts = user_input.split(" ", 2)
+            if len(parts) < 3:
+                print("Usage: /ephemeral <username> <message>")
+                continue
+            recipient, message_text = parts[1], parts[2]
+            payload = f"{recipient} {message_text}"
+            msg = Message(OPCODE_EPHEMERAL_MESSAGE, payload=payload)
+
+        # ✅ File Transfer (NEW)
         elif user_input.startswith("/file "):
-            # Basic example: just send the filename (no actual file chunking)
-            filename = user_input.split(" ", 1)[1]
-            msg = Message(opcode=OPCODE_FILE_TRANSFER, payload=filename)
+            parts = user_input.split(" ", 2)
+            if len(parts) < 3:
+                print("Usage: /file <target> <filename>")
+                continue
+            target, filename = parts[1], parts[2]
+
+            # Read file and encode as base64
+            try:
+                with open(filename, "rb") as f:
+                    file_data = base64.b64encode(f.read()).decode()
+                payload = f"{target}|{filename}|{file_data}"
+                msg = Message(OPCODE_FILE_TRANSFER, payload=payload)
+            except FileNotFoundError:
+                print(f"[ERROR] File '{filename}' not found.")
+                continue
 
         # 10. Quit
         elif user_input == "/quit":
@@ -219,6 +251,29 @@ async def receive_messages(reader: asyncio.StreamReader) -> None:
             # Decode the raw bytes into a Message
             msg = Message.decode(raw_data)
             print(f"[DEBUG] Decoded Message: Opcode={msg.opcode}, Payload={msg.payload}")
+
+            # ✅ Decrypt Secure Messages
+            if msg.opcode == OPCODE_SECURE_MESSAGE:
+                try:
+                    decrypted_text = cipher.decrypt(msg.payload.encode()).decode()
+                    print(f"[SECURE] {decrypted_text}")
+                except:
+                    print(f"[SECURE] (UNREADABLE) {msg.payload}")
+
+            # ✅ Display Ephemeral Messages
+            elif msg.opcode == OPCODE_EPHEMERAL_MESSAGE:
+                print(f"[EPHEMERAL] {msg.payload}")
+
+            # ✅ Handle File Transfers
+            elif msg.opcode == OPCODE_FILE_TRANSFER:
+                target, filename, file_data = msg.payload.split("|", 2)
+                with open(f"received_{filename}", "wb") as f:
+                    f.write(base64.b64decode(file_data))
+                print(f"[FILE] Received '{filename}' from {target}.")
+
+            # Default Messages
+            else:
+                print(f"[CHAT] {msg.payload}")
 
         except asyncio.IncompleteReadError:
             print("[ERROR] Incomplete message received. Connection may be unstable.")

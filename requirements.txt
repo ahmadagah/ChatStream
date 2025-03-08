@@ -4,3 +4,4 @@ structlog
 tomli
 typing_extensions
 aioconsole
+cryptography

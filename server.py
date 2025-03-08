@@ -1,9 +1,12 @@
+import os
 import asyncio
 import structlog
 import aioconsole
 import traceback
+from cryptography.fernet import Fernet
 import struct
 from protocol import (
+    OPCODE_EPHEMERAL_MESSAGE,
     Message,
     # Basic Operations
     OPCODE_HELLO, OPCODE_MESSAGE, OPCODE_ERROR,
@@ -19,8 +22,16 @@ from protocol import (
     ERROR_FILE_TOO_LARGE, ERROR_SERVER_FULL, ERROR_PERMISSION_DENIED, ERROR_UNKNOWN
 )
 
+from config import PORT
+
+
+# Global stop event to handle shutdown
+stop_event = asyncio.Event()
+
+
 # Initialize logger
 log = structlog.get_logger()
+
 
 # Global dictionaries to track clients and rooms
 clients = {}  # Key: username, Value: StreamWriter
@@ -28,6 +39,11 @@ rooms = {}    # Key: room name, Value: list of usernames
 
 # New: active_rooms mapping to track each user's active room
 active_rooms = {}  # Key: username, Value: active room name
+
+
+# ✅ Secure Messaging: Generate an encryption key
+fernet_key = Fernet.generate_key()
+cipher = Fernet(fernet_key)
 
 # -----------------------------
 # Helper function: Global Broadcast
@@ -280,23 +296,95 @@ async def handle_multi_room_message(username: str, payload: str) -> None:
         else:
             print(f"[DEBUG] Skipping room '{room}': Not found or {username} not in room.")
 
+
+
 async def handle_secure_message(username: str, payload: str, writer: asyncio.StreamWriter) -> None:
     """
-    Handles a secure (encrypted) message.
-    Minimal implementation: treat it like a normal message with a "SECURE:" prefix.
+    Encrypts the secure message payload and broadcasts it.
+    Clients must know the shared key to decrypt.
     """
     secure_text = f"SECURE from {username}: {payload}"
-    await broadcast_message(OPCODE_SECURE_MESSAGE, secure_text)
-    print(f"[DEBUG] Secure message broadcasted from {username}.")
+    encrypted_text = cipher.encrypt(secure_text.encode()).decode()  # ✅ Fixed: Use 'cipher' instead of 'f'
+    secure_msg = Message(OPCODE_SECURE_MESSAGE, encrypted_text)
+    await broadcast_message(OPCODE_SECURE_MESSAGE, secure_msg.payload)
+    print(f"[DEBUG] Secure message from {username} broadcasted.")
+
+
+
+async def handle_ephemeral_message(sender: str, payload: str, writer: asyncio.StreamWriter) -> None:
+    """
+    Handles an ephemeral (private) message.
+    Payload should be formatted as "<recipient> <message_text>".
+    
+    Ephemeral messages are delivered only once. Clients are expected to
+    treat messages with opcode OPCODE_EPHEMERAL_MESSAGE as temporary.
+    """
+    try:
+        recipient, message_text = payload.split(" ", 1)
+    except ValueError:
+        error_msg = Message(OPCODE_ERROR, "Usage: /ephemeral <username> <message>")
+        writer.write(error_msg.encode())
+        await writer.drain()
+        return
+
+    if recipient not in clients:
+        error_msg = Message(OPCODE_ERROR, f"User {recipient} not found")
+        writer.write(error_msg.encode())
+        await writer.drain()
+        print(f"[DEBUG] Sent error: User {recipient} not found.")
+        return
+
+    ephemeral_msg = Message(OPCODE_EPHEMERAL_MESSAGE, f"Ephemeral from {sender}: {message_text}")
+    clients[recipient].write(ephemeral_msg.encode())
+    await clients[recipient].drain()
+    print(f"[DEBUG] Ephemeral message from {sender} sent to {recipient}.")
+
 
 async def handle_file_transfer(username: str, payload: str, writer: asyncio.StreamWriter) -> None:
     """
     Handles file transfer.
-    Minimal stub: simply broadcasts the filename.
+    Expected payload format:
+      "<target> | <filename> | <base64_encoded_file_data>"
+    
+    If <target> is a username in 'clients', the file is sent privately.
+    If <target> is a room name in 'rooms', the file is sent to that room.
+    Otherwise, an error message is returned.
     """
-    transfer_info = f"{username} is sending file: {payload}"
-    await broadcast_message(OPCODE_FILE_TRANSFER, transfer_info)
-    print(f"[DEBUG] File transfer info broadcasted from {username}.")
+    parts = payload.split("|")
+    if len(parts) < 3:
+        error_msg = Message(OPCODE_ERROR, "Usage: /file <target>|<filename>|<file_data>")
+        writer.write(error_msg.encode())
+        await writer.drain()
+        return
+
+    target = parts[0].strip()
+    filename = parts[1].strip()
+    file_data = parts[2].strip()
+
+    # Prepare file transfer information with the file data
+    file_info = f"{username} is sending file '{filename}'"
+    # Construct the file message payload: include file_info and file_data separated by a pipe.
+    file_msg_payload = f"{file_info}|{file_data}"
+    file_msg = Message(OPCODE_FILE_TRANSFER, file_msg_payload)
+
+    # Check if the target is a username for a private file transfer.
+    if target in clients:
+        try:
+            clients[target].write(file_msg.encode())
+            await clients[target].drain()
+            print(f"[DEBUG] File '{filename}' from {username} sent privately to {target}.")
+        except Exception as e:
+            print(f"[ERROR] Failed to send file to {target}: {e}")
+            traceback.print_exc()
+    # Otherwise, check if target is a room name for a room-based file transfer.
+    elif target in rooms:
+        await send_room_message(target, file_msg_payload, username)
+        print(f"[DEBUG] File '{filename}' from {username} sent to room '{target}'.")
+    else:
+        error_msg = Message(OPCODE_ERROR, f"Target '{target}' not found")
+        writer.write(error_msg.encode())
+        await writer.drain()
+        print(f"[DEBUG] Sent error: Target '{target}' not found.")
 
 
 
@@ -438,6 +526,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await handle_multi_room_message(username, msg.payload)
             elif msg.opcode == OPCODE_SECURE_MESSAGE:
                 await handle_secure_message(username, msg.payload, writer)
+            elif msg.opcode == OPCODE_EPHEMERAL_MESSAGE:
+                await handle_ephemeral_message(username, msg.payload, writer)
             elif msg.opcode == OPCODE_FILE_TRANSFER:
                 await handle_file_transfer(username, msg.payload, writer)
             elif msg.opcode == OPCODE_CLIENT_DISCONNECT:
@@ -466,18 +556,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 # Main Function to Start Server
 # -----------------------------
 async def main() -> None:
-    server = await asyncio.start_server(handle_client, "0.0.0.0", 6060)
-    log.info("[INFO] Server started on port 6060")
+    server = await asyncio.start_server(handle_client, "0.0.0.0", PORT)
+    log.info(f"[INFO] Server started on port {PORT}")
 
-    # Create the admin console task (which will trigger shutdown on 'quit')
+    # Create the admin console task (which will trigger shutdown on 'quit'), it works only in non-production mode
     console_task = asyncio.create_task(server_console(server))
 
     try:
         # Run both the server's serve_forever() and the admin console concurrently.
-        await asyncio.gather(server.serve_forever(), console_task)
+        await asyncio.gather(server.serve_forever(), console_task)  # Run both tasks concurrently
+        # await server.serve_forever()
     except asyncio.CancelledError:
         # Expected cancellation when the server is shut down.
-        pass
+        log.info("[INFO] Server shutting down...")
+    finally:
+        log.info("[INFO] Server shutdown complete.")
 
     # This print will execute after both tasks have finished.
     print("[ADMIN] All clients disconnected and server shutdown gracefully.")

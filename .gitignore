@@ -1,3 +1,25 @@
+# Docker-related files
+.dockerignore
+docker-compose.yml
+docker-compose.override.yml
+docker-compose*.yaml
+Dockerfile
+Dockerfile.*
+.docker/
+docker-volumes/
+docker-data/
+docker-network/
+docker-logs/
+docker-cache/
+compose.yaml
+compose.override.yaml
+
+# Docker Desktop specific
+~/.docker/
+~/.docker/config.json
+~/.docker/desktop/
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
